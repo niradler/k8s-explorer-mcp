@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "k8s-explorer-mcp"
+version = "0.1.0"
+description = "Intelligent MCP server for Kubernetes resource exploration, relationship mapping, and debugging with AI-powered insights"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Nir Adler"}
+]
+maintainers = [
+    {name = "Nir Adler"}
+]
+keywords = [
+    "kubernetes",
+    "k8s",
+    "mcp",
+    "model-context-protocol",
+    "llm",
+    "ai",
+    "resource-management",
+    "devops",
+    "cloud-native",
+    "debugging",
+    "monitoring",
+    "kubectl",
+    "helm",
+    "argocd",
+    "operators"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Systems Administration",
+    "Topic :: System :: Monitoring",
+    "Environment :: Console",
+    "Framework :: FastMCP",
+    "Typing :: Typed"
+]
+
+dependencies = [
+    "fastmcp>=2.13.0",
+    "kubernetes>=34.0.0",
+    "cachetools>=6.2.0",
+    "pydantic>=2.12.0",
+    "aiohttp>=3.13.0",
+    "networkx>=3.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.2.0",
+    "black>=25.9.0",
+    "mypy>=1.18.0",
+    "ruff>=0.14.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/nirwo/k8s-explorer-mcp"
+Documentation = "https://github.com/nirwo/k8s-explorer-mcp/blob/main/README.md"
+Repository = "https://github.com/nirwo/k8s-explorer-mcp"
+Issues = "https://github.com/nirwo/k8s-explorer-mcp/issues"
+Changelog = "https://github.com/nirwo/k8s-explorer-mcp/releases"
+
+[project.scripts]
+k8s-mcp = "server:main"
+
+[tool.setuptools]
+packages = ["k8s_explorer", "k8s_explorer.operators", "k8s_explorer.graph", "k8s_explorer.graph.discoverers"]
+
+[tool.setuptools.package-data]
+k8s_explorer = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "N", "W"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+

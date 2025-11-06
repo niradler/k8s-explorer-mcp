@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "k8s-tree-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/Users/nir/Documents/projects/os/k8s-tree-mcp",
+        "run",
+        "server.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
+
