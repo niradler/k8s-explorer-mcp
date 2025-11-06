@@ -28,30 +28,77 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("K8s Explorer Server")
+mcp = FastMCP(
+    "K8s Explorer Server",
+    instructions="""
+Kubernetes resource explorer with intelligent caching and multi-cluster support.
 
-k8s_client: Optional[K8sClient] = None
-relationship_discovery: Optional[RelationshipDiscovery] = None
+**Multi-Context Usage:**
+- All tools accept optional `context` parameter to target specific K8s clusters
+- Without `context`, uses current kubectl context
+- Call `list_contexts()` first to see available clusters
+
+**Key Features:**
+- Smart pod matching (handles recreation with fuzzy matching)
+- Context-aware caching (60s resources, 120s relationships)
+- Cache shared across contexts for efficiency
+- Permission-aware responses
+
+**Common Workflows:**
+1. List contexts → Choose context → Query resources
+2. `discover_resource(kind, name, namespace, context)` - Full resource context
+3. `get_pod_logs(name, namespace, context)` - Auto-handles multi-container
+4. `build_resource_graph(namespace, context)` - Visualize dependencies
+
+**Best Practices:**
+- Specify context when working with multiple clusters
+- Use depth="relationships" for quick queries
+- Cache automatically handles context isolation
+- Fuzzy matching works for Pods across contexts
+""",
+)
+
+k8s_clients: Dict[str, K8sClient] = {}
+relationship_discoveries: Dict[str, RelationshipDiscovery] = {}
+graph_builders: Dict[str, GraphBuilder] = {}
 crd_registry: Optional[CRDOperatorRegistry] = None
 response_filter: Optional[ResponseFilter] = None
-graph_builder: Optional[GraphBuilder] = None
 graph_cache: Optional[GraphCache] = None
+shared_cache: Optional[K8sCache] = None
 
 
-def _ensure_initialized():
-    """Ensure K8s client is initialized."""
-    global k8s_client, relationship_discovery, crd_registry, response_filter, graph_builder, graph_cache
+def _ensure_initialized(context: Optional[str] = None):
+    """Ensure K8s client is initialized for the given context.
+    
+    Args:
+        context: Kubernetes context name. If None, uses current active context.
+        
+    Returns:
+        Tuple of (k8s_client, relationship_discovery, graph_builder)
+    """
+    global k8s_clients, relationship_discoveries, graph_builders
+    global crd_registry, response_filter, graph_cache, shared_cache
 
-    if k8s_client is None:
-        logger.info("Initializing Kubernetes client...")
-        cache = K8sCache(resource_ttl=60, relationship_ttl=120, list_query_ttl=180, max_size=2000)
-        k8s_client = K8sClient(cache=cache)
-        relationship_discovery = RelationshipDiscovery(k8s_client)
+    if shared_cache is None:
+        logger.info("Initializing shared cache...")
+        shared_cache = K8sCache(resource_ttl=60, relationship_ttl=120, list_query_ttl=180, max_size=2000)
+    
+    if crd_registry is None:
         crd_registry = CRDOperatorRegistry()
         response_filter = ResponseFilter(max_conditions=3, max_annotations=5)
         graph_cache = GraphCache(ttl=300, max_size=100)
-        graph_builder = GraphBuilder(k8s_client, graph_cache)
-        logger.info("Kubernetes client initialized successfully")
+
+    ctx_key = context or "current"
+    
+    if ctx_key not in k8s_clients:
+        logger.info(f"Initializing Kubernetes client for context: {context or 'current'}...")
+        k8s_client = K8sClient(cache=shared_cache, context=context)
+        k8s_clients[ctx_key] = k8s_client
+        relationship_discoveries[ctx_key] = RelationshipDiscovery(k8s_client)
+        graph_builders[ctx_key] = GraphBuilder(k8s_client, graph_cache)
+        logger.info(f"Kubernetes client initialized successfully for context: {k8s_client.context}")
+    
+    return k8s_clients[ctx_key], relationship_discoveries[ctx_key], graph_builders[ctx_key]
 
 
 @mcp.tool()
@@ -60,6 +107,7 @@ async def list_resources(
     namespace: str = "default",
     labels: Optional[Dict[str, str]] = None,
     all_namespaces: bool = False,
+    context: Optional[str] = None,
 ) -> dict:
     """
     List Kubernetes resources of any kind.
@@ -71,11 +119,12 @@ async def list_resources(
         namespace: Kubernetes namespace (ignored if all_namespaces=True)
         labels: Optional label filters (e.g., {"app": "nginx"})
         all_namespaces: List across all namespaces
+        context: Kubernetes context name (optional, uses current context if not specified)
 
     Returns:
         List of resources with summary info
     """
-    _ensure_initialized()
+    k8s_client, _, _ = _ensure_initialized(context)
 
     label_selector = None
     if labels:
@@ -124,7 +173,9 @@ async def list_resources(
 
 
 @mcp.tool()
-async def get_resource(kind: str, name: str, namespace: str = "default") -> dict:
+async def get_resource(
+    kind: str, name: str, namespace: str = "default", context: Optional[str] = None
+) -> dict:
     """
     Get a specific Kubernetes resource by name.
 
@@ -135,11 +186,12 @@ async def get_resource(kind: str, name: str, namespace: str = "default") -> dict
         kind: Resource kind (Pod, Deployment, Service, ConfigMap, Secret, etc.)
         name: Resource name (supports fuzzy matching for Pods)
         namespace: Kubernetes namespace
+        context: Kubernetes context name (optional, uses current context if not specified)
 
     Returns:
         Resource details or error
     """
-    _ensure_initialized()
+    k8s_client, _, _ = _ensure_initialized(context)
 
     resource_id = ResourceIdentifier(kind=kind, name=name, namespace=namespace)
 
@@ -175,7 +227,9 @@ async def get_resource(kind: str, name: str, namespace: str = "default") -> dict
 
 
 @mcp.tool()
-async def kubectl(args: List[str], namespace: Optional[str] = "default") -> dict:
+async def kubectl(
+    args: List[str], namespace: Optional[str] = "default", context: Optional[str] = None
+) -> dict:
     """
     Execute kubectl commands for operations not covered by specialized tools.
 
@@ -185,16 +239,19 @@ async def kubectl(args: List[str], namespace: Optional[str] = "default") -> dict
     Args:
         args: kubectl arguments as list (e.g., ["get", "pods", "-o", "json"])
         namespace: Namespace to use (adds -n flag automatically)
+        context: Kubernetes context name (optional, uses current context if not specified)
 
     Returns:
         Command output or error
     """
-    _ensure_initialized()
+    k8s_client, _, _ = _ensure_initialized(context)
 
     try:
         import subprocess
 
         cmd = ["kubectl"]
+        if context:
+            cmd.extend(["--context", context])
         if namespace and namespace != "all":
             cmd.extend(["-n", namespace])
         cmd.extend(args)
@@ -225,11 +282,14 @@ async def list_contexts() -> dict:
     List available Kubernetes contexts and accessible namespaces.
 
     Permission-aware: Shows which namespaces you can actually access.
+    
+    Note: This tool inspects the current/default context to show accessible namespaces.
+    Use the 'context' parameter in other tools to switch to a different context.
 
     Returns:
         Available contexts, current context, and accessible namespaces
     """
-    _ensure_initialized()
+    k8s_client, _, _ = _ensure_initialized()
 
     try:
         from kubernetes import config as k8s_config
@@ -248,6 +308,7 @@ async def list_contexts() -> dict:
                 f"You have access to {len(accessible_namespaces)} namespace(s). "
                 "Responses are limited to resources you can access."
             ),
+            "usage_note": "To use a different context, pass the 'context' parameter to other tools.",
         }
     except Exception as e:
         return {"error": str(e)}
@@ -255,7 +316,11 @@ async def list_contexts() -> dict:
 
 @mcp.tool()
 async def discover_resource(
-    kind: str, name: str, namespace: str = "default", depth: str = "complete"
+    kind: str,
+    name: str,
+    namespace: str = "default",
+    depth: str = "complete",
+    context: Optional[str] = None,
 ) -> dict:
     """
     Discover resource information with configurable depth.
@@ -276,11 +341,12 @@ async def discover_resource(
         name: Resource name
         namespace: Kubernetes namespace
         depth: Discovery depth ("relationships" | "tree" | "complete")
+        context: Kubernetes context name (optional, uses current context if not specified)
 
     Returns:
         Resource discovery data based on depth level
     """
-    _ensure_initialized()
+    k8s_client, relationship_discovery, _ = _ensure_initialized(context)
 
     if depth not in ["relationships", "tree", "complete"]:
         return {"error": f"Invalid depth: {depth}. Use 'relationships', 'tree', or 'complete'"}
@@ -434,6 +500,7 @@ async def get_pod_logs(
     previous: bool = False,
     tail: int = 100,
     timestamps: bool = False,
+    context: Optional[str] = None,
 ) -> dict:
     """
     Get pod logs - optimized for LLM consumption.
@@ -448,11 +515,12 @@ async def get_pod_logs(
         previous: Get logs from previous terminated container
         tail: Number of lines to show (default: 100, max: 1000)
         timestamps: Include timestamps in output
+        context: Kubernetes context name (optional, uses current context if not specified)
 
     Returns:
         Pod logs with metadata (containers, truncation info, pod status)
     """
-    _ensure_initialized()
+    k8s_client, _, _ = _ensure_initialized(context)
 
     tail = min(tail, 1000)
 
@@ -532,7 +600,11 @@ async def get_pod_logs(
 
 @mcp.tool()
 async def get_resource_changes(
-    kind: str, name: str, namespace: str = "default", max_versions: Optional[int] = 5
+    kind: str,
+    name: str,
+    namespace: str = "default",
+    max_versions: Optional[int] = 5,
+    context: Optional[str] = None,
 ) -> dict:
     """
     Get change history for a resource showing what changed between versions.
@@ -545,11 +617,16 @@ async def get_resource_changes(
         name: Resource name
         namespace: Namespace
         max_versions: Max number of versions to show (default: 5, LLM can adjust)
+        context: Kubernetes context name (optional, uses current context if not specified)
 
     Returns:
         Timeline of changes with diffs, not full payloads
     """
-    _ensure_initialized()
+    k8s_client, _, _ = _ensure_initialized(context)
+
+    if max_versions is None:
+        max_versions = 5
+    max_versions = min(max_versions, 20)
 
     try:
         if kind == "Deployment":
@@ -622,6 +699,7 @@ async def compare_resource_versions(
     namespace: str = "default",
     from_revision: Optional[int] = None,
     to_revision: Optional[int] = None,
+    context: Optional[str] = None,
 ) -> dict:
     """
     Compare specific versions of a resource to see exact changes.
@@ -634,11 +712,12 @@ async def compare_resource_versions(
         namespace: Namespace
         from_revision: Start revision (default: previous)
         to_revision: End revision (default: current)
+        context: Kubernetes context name (optional, uses current context if not specified)
 
     Returns:
         Detailed comparison with field-level changes
     """
-    _ensure_initialized()
+    k8s_client, _, _ = _ensure_initialized(context)
 
     try:
         if kind == "Deployment":
@@ -711,6 +790,7 @@ async def build_resource_graph(
     include_network: bool = True,
     include_crds: bool = True,
     cluster_id: Optional[str] = None,
+    context: Optional[str] = None,
 ) -> dict:
     """
     Build K8s resource graph for namespace with optional specific resource entry point.
@@ -734,6 +814,7 @@ async def build_resource_graph(
         include_network: Include NetworkPolicy relationships
         include_crds: Include CRD/Operator relationships (Airflow, ArgoCD, Helm, etc.)
         cluster_id: Optional cluster identifier for multi-cluster environments
+        context: Kubernetes context name (optional, uses current context if not specified)
 
     Returns:
         Graph in LLM-friendly format with merged namespace graph.
@@ -748,13 +829,13 @@ async def build_resource_graph(
         - {"namespace": "prod"}
         - {"namespace": "default", "depth": 2}
     """
-    _ensure_initialized()
+    k8s_client, _, graph_builder = _ensure_initialized(context)
 
     try:
         if kind and not name:
             return {"error": "name is required when kind is specified"}
 
-        cluster = cluster_id or "default"
+        cluster = cluster_id or context or "default"
 
         build_options = BuildOptions(
             include_rbac=include_rbac,

@@ -17,15 +17,45 @@ logger = logging.getLogger(__name__)
 class K8sClient:
     """Kubernetes client with caching and permission awareness."""
 
-    def __init__(self, cache: Optional[K8sCache] = None, check_permissions: bool = True):
-        """Initialize K8s client."""
+    def __init__(
+        self,
+        cache: Optional[K8sCache] = None,
+        check_permissions: bool = True,
+        context: Optional[str] = None,
+    ):
+        """Initialize K8s client.
+        
+        Args:
+            cache: Optional cache instance
+            check_permissions: Whether to check RBAC permissions
+            context: Optional Kubernetes context name. If None, uses current context.
+        """
+        self.context = context
+        self._load_config()
+
+        self.cache = cache or K8sCache()
+        self.permission_checker = PermissionChecker(self.api_client) if check_permissions else None
+        self._api_mapping = self._build_api_mapping()
+
+        if self.permission_checker:
+            logger.info("Permission checking enabled")
+    
+    def _load_config(self):
+        """Load Kubernetes configuration for the specified context."""
         try:
             config.load_incluster_config()
             logger.info("Loaded in-cluster Kubernetes config")
+            self.context = self.context or "in-cluster"
         except config.ConfigException:
             try:
-                config.load_kube_config()
-                logger.info("Loaded Kubernetes config from kubeconfig")
+                if self.context:
+                    config.load_kube_config(context=self.context)
+                    logger.info(f"Loaded Kubernetes config for context: {self.context}")
+                else:
+                    config.load_kube_config()
+                    _, active_context = config.list_kube_config_contexts()
+                    self.context = active_context["name"] if active_context else "default"
+                    logger.info(f"Loaded Kubernetes config from kubeconfig (context: {self.context})")
             except config.ConfigException as e:
                 logger.error(f"Failed to load Kubernetes config: {e}")
                 raise
@@ -35,13 +65,6 @@ class K8sClient:
         self.batch_v1 = client.BatchV1Api()
         self.networking_v1 = client.NetworkingV1Api()
         self.api_client = client.ApiClient()
-
-        self.cache = cache or K8sCache()
-        self.permission_checker = PermissionChecker(self.api_client) if check_permissions else None
-        self._api_mapping = self._build_api_mapping()
-
-        if self.permission_checker:
-            logger.info("Permission checking enabled")
 
     def _build_api_mapping(self) -> Dict[str, Any]:
         """Build mapping of resource kinds to API methods."""
@@ -107,7 +130,7 @@ class K8sClient:
     ) -> Optional[Dict[str, Any]]:
         """Get a resource by identifier."""
         if use_cache:
-            cached = self.cache.get_resource(resource_id)
+            cached = self.cache.get_resource(resource_id, context=self.context)
             if cached is not None:
                 return cached
 
@@ -126,7 +149,7 @@ class K8sClient:
                 resource_dict = self.api_client.sanitize_for_serialization(result)
 
                 if use_cache:
-                    self.cache.set_resource(resource_id, resource_dict)
+                    self.cache.set_resource(resource_id, resource_dict, context=self.context)
 
                 return resource_dict
 
@@ -243,7 +266,7 @@ class K8sClient:
         cache_key = CacheKey(namespace=namespace, kind=kind, label_selector=label_selector)
 
         if use_cache:
-            cached = self.cache.get_list_query(cache_key)
+            cached = self.cache.get_list_query(cache_key, context=self.context)
             if cached is not None:
                 return cached, permission_notice
 
@@ -272,9 +295,12 @@ class K8sClient:
                     resources.append(resource)
 
                 if use_cache:
-                    self.cache.set_list_query(cache_key, resources)
+                    self.cache.set_list_query(cache_key, resources, context=self.context)
 
                 return resources, permission_notice
+            else:
+                logger.warning(f"Resource kind '{kind}' not supported by client API mapping")
+                return [], {"error": f"Resource kind '{kind}' not supported. Use kubectl tool for custom resources."}
 
         except ApiException as e:
             if e.status == 403:

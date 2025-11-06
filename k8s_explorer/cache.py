@@ -62,9 +62,11 @@ class K8sCache:
         self._stats_lock = Lock()
 
     # Resource Cache Methods
-    def get_resource(self, resource_id: ResourceIdentifier) -> Optional[Dict[str, Any]]:
+    def get_resource(
+        self, resource_id: ResourceIdentifier, context: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """Get resource from cache."""
-        key = self._resource_key(resource_id)
+        key = self._resource_key(resource_id, context)
         with self._resource_lock:
             value = self._resource_cache.get(key)
             with self._stats_lock:
@@ -76,23 +78,29 @@ class K8sCache:
                     logger.debug(f"Cache MISS: Resource {key}")
             return value
 
-    def set_resource(self, resource_id: ResourceIdentifier, data: Dict[str, Any]):
+    def set_resource(
+        self, resource_id: ResourceIdentifier, data: Dict[str, Any], context: Optional[str] = None
+    ):
         """Store resource in cache."""
-        key = self._resource_key(resource_id)
+        key = self._resource_key(resource_id, context)
         with self._resource_lock:
             self._resource_cache[key] = data
             logger.debug(f"Cache SET: Resource {key}")
 
-    def _resource_key(self, resource_id: ResourceIdentifier) -> str:
+    def _resource_key(self, resource_id: ResourceIdentifier, context: Optional[str] = None) -> str:
         """Generate cache key for resource."""
-        return f"{resource_id.kind}:{resource_id.namespace or 'cluster'}:{resource_id.name}"
+        ctx = context or "default"
+        return f"{ctx}:{resource_id.kind}:{resource_id.namespace or 'cluster'}:{resource_id.name}"
 
     # Relationship Cache Methods
     def get_relationships(
-        self, resource_id: ResourceIdentifier, relationship_type: str
+        self,
+        resource_id: ResourceIdentifier,
+        relationship_type: str,
+        context: Optional[str] = None,
     ) -> Optional[List[ResourceIdentifier]]:
         """Get cached relationships."""
-        key = f"{self._resource_key(resource_id)}:rel:{relationship_type}"
+        key = f"{self._resource_key(resource_id, context)}:rel:{relationship_type}"
         with self._relationship_lock:
             value = self._relationship_cache.get(key)
             with self._stats_lock:
@@ -109,17 +117,21 @@ class K8sCache:
         resource_id: ResourceIdentifier,
         relationship_type: str,
         resources: List[ResourceIdentifier],
+        context: Optional[str] = None,
     ):
         """Store relationships in cache."""
-        key = f"{self._resource_key(resource_id)}:rel:{relationship_type}"
+        key = f"{self._resource_key(resource_id, context)}:rel:{relationship_type}"
         with self._relationship_lock:
             self._relationship_cache[key] = resources
             logger.debug(f"Cache SET: Relationship {key}")
 
     # List Query Cache Methods
-    def get_list_query(self, cache_key: CacheKey) -> Optional[List[Dict[str, Any]]]:
+    def get_list_query(
+        self, cache_key: CacheKey, context: Optional[str] = None
+    ) -> Optional[List[Dict[str, Any]]]:
         """Get cached list query result."""
-        key = cache_key.to_string()
+        ctx = context or "default"
+        key = f"{ctx}:{cache_key.to_string()}"
         with self._list_lock:
             value = self._list_cache.get(key)
             with self._stats_lock:
@@ -131,9 +143,12 @@ class K8sCache:
                     logger.debug(f"Cache MISS: List query {key}")
             return value
 
-    def set_list_query(self, cache_key: CacheKey, data: List[Dict[str, Any]]):
+    def set_list_query(
+        self, cache_key: CacheKey, data: List[Dict[str, Any]], context: Optional[str] = None
+    ):
         """Store list query result in cache."""
-        key = cache_key.to_string()
+        ctx = context or "default"
+        key = f"{ctx}:{cache_key.to_string()}"
         with self._list_lock:
             self._list_cache[key] = data
             logger.debug(f"Cache SET: List query {key}")
@@ -158,9 +173,9 @@ class K8sCache:
             self._api_cache[key] = resources
 
     # Cache Management Methods
-    def invalidate_resource(self, resource_id: ResourceIdentifier):
+    def invalidate_resource(self, resource_id: ResourceIdentifier, context: Optional[str] = None):
         """Invalidate a specific resource and its relationships."""
-        key = self._resource_key(resource_id)
+        key = self._resource_key(resource_id, context)
         with self._resource_lock:
             self._resource_cache.pop(key, None)
 
@@ -172,23 +187,29 @@ class K8sCache:
 
         logger.info(f"Invalidated cache for {key}")
 
-    def invalidate_namespace(self, namespace: str):
+    def invalidate_namespace(self, namespace: str, context: Optional[str] = None):
         """Invalidate all resources in a namespace."""
+        ctx = context or "default"
+        ctx_prefix = f"{ctx}:"
+        
         with self._resource_lock:
             keys_to_remove = [
                 k
                 for k in self._resource_cache.keys()
-                if f":{namespace}:" in k or f":{namespace}/" in k
+                if k.startswith(ctx_prefix) and (f":{namespace}:" in k or f":{namespace}/" in k)
             ]
             for k in keys_to_remove:
                 self._resource_cache.pop(k, None)
 
         with self._list_lock:
-            keys_to_remove = [k for k in self._list_cache.keys() if f"ns:{namespace}" in k]
+            keys_to_remove = [
+                k for k in self._list_cache.keys() 
+                if k.startswith(ctx_prefix) and f"ns:{namespace}" in k
+            ]
             for k in keys_to_remove:
                 self._list_cache.pop(k, None)
 
-        logger.info(f"Invalidated cache for namespace {namespace}")
+        logger.info(f"Invalidated cache for namespace {namespace} in context {ctx}")
 
     def clear_all(self):
         """Clear all caches."""

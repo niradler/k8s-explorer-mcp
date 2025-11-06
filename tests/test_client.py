@@ -58,7 +58,7 @@ class TestK8sClient:
         rid = ResourceIdentifier(kind="Pod", name="test", namespace="default")
         cached_data = {"kind": "Pod", "metadata": {"name": "test"}}
 
-        k8s_client.cache.set_resource(rid, cached_data)
+        k8s_client.cache.set_resource(rid, cached_data, context=k8s_client.context)
 
         result = await k8s_client.get_resource(rid, use_cache=True)
         assert result == cached_data
@@ -68,7 +68,7 @@ class TestK8sClient:
         rid = ResourceIdentifier(kind="Pod", name="test", namespace="default")
         cached_data = {"kind": "Pod", "metadata": {"name": "test"}}
 
-        k8s_client.cache.set_resource(rid, cached_data)
+        k8s_client.cache.set_resource(rid, cached_data, context=k8s_client.context)
 
         mock_response = MagicMock()
         mock_response.metadata.name = "test"
@@ -89,7 +89,7 @@ class TestFuzzyMatching:
         rid = ResourceIdentifier(kind="Pod", name="test-pod", namespace="default")
         pod_data = {"kind": "Pod", "metadata": {"name": "test-pod"}}
 
-        k8s_client.cache.set_resource(rid, pod_data)
+        k8s_client.cache.set_resource(rid, pod_data, context=k8s_client.context)
 
         result, match_info = await k8s_client.get_resource_or_similar(rid)
 
