@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "k8s-explorer-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Intelligent MCP server for Kubernetes resource exploration, relationship mapping, and debugging with AI-powered insights"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -48,7 +48,6 @@ classifiers = [
     "Topic :: System :: Systems Administration",
     "Topic :: System :: Monitoring",
     "Environment :: Console",
-    "Framework :: FastMCP",
     "Typing :: Typed"
 ]
 
@@ -78,7 +77,7 @@ Issues = "https://github.com/nirwo/k8s-explorer-mcp/issues"
 Changelog = "https://github.com/nirwo/k8s-explorer-mcp/releases"
 
 [project.scripts]
-k8s-mcp = "server:main"
+k8s-explorer-mcp = "server:main"
 
 [tool.setuptools]
 packages = ["k8s_explorer", "k8s_explorer.operators", "k8s_explorer.graph", "k8s_explorer.graph.discoverers"]

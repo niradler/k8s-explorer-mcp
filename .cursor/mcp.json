@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "k8s-tree-mcp": {
+    "k8s-explorer-dev": {
       "command": "uv",
       "args": [
         "--directory",
@@ -11,6 +11,12 @@
       "env": {
         "PYTHONUNBUFFERED": "1"
       }
+    },
+    "k8s-explorer-mcp": {
+      "command": "uvx",
+      "args": [
+       "k8s-explorer-mcp"
+      ]
     }
   }
 }
