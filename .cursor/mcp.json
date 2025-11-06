@@ -4,9 +4,9 @@
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/nir/Documents/projects/os/k8s-tree-mcp",
+        ".",
         "run",
-        "server.py"
+        "k8s_explorer/server.py"
       ],
       "env": {
         "PYTHONUNBUFFERED": "1"
@@ -15,6 +15,7 @@
     "k8s-explorer-mcp": {
       "command": "uvx",
       "args": [
+        "--no-cache",
        "k8s-explorer-mcp"
       ]
     }
