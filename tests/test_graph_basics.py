@@ -24,7 +24,20 @@ class TestNodeIdentity:
             },
         }
         node_id = NodeIdentity.get_node_id(resource)
-        assert node_id == "Pod:default:ReplicaSet-nginx-abc123:abc123"
+        assert node_id == "Pod:default:nginx-abc123-xyz"
+    
+    def test_get_pod_template_id(self):
+        resource = {
+            "kind": "Pod",
+            "metadata": {
+                "name": "nginx-abc123-xyz",
+                "namespace": "default",
+                "labels": {"pod-template-hash": "abc123"},
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "nginx-abc123"}],
+            },
+        }
+        template_id = NodeIdentity.get_pod_template_id(resource)
+        assert template_id == "PodTemplate:default:ReplicaSet-nginx-abc123:abc123"
 
     def test_get_node_id_for_standalone_pod(self):
         resource = {"kind": "Pod", "metadata": {"name": "debug-pod", "namespace": "default"}}
@@ -34,7 +47,8 @@ class TestNodeIdentity:
     def test_is_stable_resource(self):
         assert NodeIdentity.is_stable_resource("Deployment") == True
         assert NodeIdentity.is_stable_resource("Service") == True
-        assert NodeIdentity.is_stable_resource("Pod") == False
+        assert NodeIdentity.is_stable_resource("ConfigMap") == True
+        assert NodeIdentity.is_stable_resource("UnknownKind") == False
 
     def test_extract_node_attributes_deployment(self):
         resource = {
@@ -175,11 +189,11 @@ class TestGraphFormatter:
 
         result = GraphFormatter.to_llm_dict(graph, query_info, merge_result, metadata)
 
-        assert result["namespace"] == "default"
-        assert result["node_count"] == 2
-        assert result["edge_count"] == 1
-        assert result["new_nodes"] == 2
-        assert result["new_edges"] == 1
+        assert result["metadata"]["primary_namespace"] == "default"
+        assert result["metadata"]["cluster"] == "test"
+        assert result["metadata"]["cache_hit"] == True
+        assert result["counts"]["total_nodes"] == 2
+        assert result["counts"]["total_edges"] == 1
         assert len(result["nodes"]) == 2
         assert len(result["edges"]) == 1
         assert "summary" in result

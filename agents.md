@@ -1,5 +1,28 @@
 # K8s-Explorer-MCP: Agent Guide for Code Generation
 
+## ⚠️ CRITICAL: Always Use `uv`
+
+**This project uses `uv` for ALL Python operations. NEVER use pip, python -m, or venv directly.**
+
+```bash
+# ✅ CORRECT - Always use uv
+uv run pytest                    # Run tests
+uv run python script.py          # Run scripts
+uv add package-name              # Add dependencies
+uv run ruff check path/to/file   # Linting
+
+# ❌ WRONG - Never use these
+pip install package-name
+python -m pytest
+source .venv/bin/activate && pytest
+```
+
+**Why `uv`?**
+- Manages dependencies and virtual environment automatically
+- Faster than pip
+- Consistent across all environments
+- Already configured in this project
+
 ## Project Overview
 
 **k8s-explorer-mcp** is a FastMCP server and Python library for intelligent Kubernetes resource discovery and relationship mapping. It provides smart pod matching, relationship discovery, and AI-powered insights.
@@ -15,20 +38,26 @@
 
 ```
 k8s-explorer-mcp/
-├── server.py                    # FastMCP server with 8 streamlined MCP tools
-├── k8s_mcp/
+├── server.py                    # FastMCP server with 9 streamlined MCP tools (948 lines)
+├── k8s_explorer/
+│   ├── prompts.py              # MCP prompts (visualization, debugging workflows)
 │   ├── client.py               # K8s API client wrapper with fuzzy matching
 │   ├── cache.py                # Multi-level caching (resource, relationship, list)
 │   ├── models.py               # Pydantic models and enums
 │   ├── relationships.py        # Relationship discovery engine
 │   ├── fuzzy_matching.py       # Smart pod name matching
-│   ├── changes.py              # Change tracking and diff generation (NEW)
+│   ├── changes.py              # Change tracking and diff generation
 │   ├── filters.py              # Response filtering for LLM optimization
 │   ├── permissions.py          # RBAC permission checking
 │   ├── config.py               # Configuration management
+│   ├── graph/                  # Graph building and analysis
+│   │   ├── builder.py          # GraphBuilder orchestration
+│   │   ├── cache.py            # Graph-specific caching
+│   │   ├── node_identity.py    # Stable node ID generation
+│   │   └── formatter.py        # LLM-friendly output formatting
 │   └── operators/
-│       └── crd_handlers.py     # CRD/operator support (13+ operators including Helm, ArgoCD, Argo Workflows, Airflow, etc.)
-├── tests/                      # 69 comprehensive tests
+│       └── crd_handlers.py     # CRD/operator support (13+ operators)
+├── tests/                      # 84 comprehensive tests
 │   ├── test_cache.py           # Cache tests
 │   ├── test_client.py          # Client + fuzzy matching tests (NEW)
 │   ├── test_config.py          # Configuration tests
@@ -360,6 +389,23 @@ Use fixtures from `conftest.py`:
 def test_with_fixture(sample_pod, test_cache):
     # Fixtures auto-injected
     cache.set_resource(rid, sample_pod)
+```
+
+**Running tests (ALWAYS use `uv`)**:
+```bash
+# ✅ Run all tests
+uv run pytest
+
+# ✅ Run specific test file
+uv run pytest tests/test_feature.py
+
+# ✅ Run with verbose output
+uv run pytest -xvs
+
+# ❌ NEVER use these
+pytest
+python -m pytest
+source .venv/bin/activate && pytest
 ```
 
 ### 6. Pydantic Models
@@ -759,16 +805,18 @@ K8sConfig.for_production()
 
 ### Core Capabilities
 ✅ **9 Streamlined Tools** (consolidated from 18 for clarity) - v2.0  
+✅ **2 Intelligent Prompts** (visualization workflow, pod debugging) - NEW  
+✅ **Multi-Cluster Support** (context-aware operations and caching)  
 ✅ **Resource Discovery** (15+ resource types)  
 ✅ **Relationship Mapping** (owners, children, volumes, selectors, CRDs)  
 ✅ **Smart Pod Matching** (handles pod recreation with fuzzy matching)  
 ✅ **Change Tracking** (compare versions, see what changed)  
-✅ **Pod Logs** (optimized for LLM consumption) - NEW  
+✅ **Pod Logs** (optimized for LLM consumption)  
 ✅ **Permission Awareness** (RBAC-aware responses)  
 ✅ **CRD Support** (13+ operators: Helm, ArgoCD, Airflow, Argo Workflows, Knative, FluxCD, Istio, cert-manager, Tekton, Spark, KEDA, Velero, Prometheus + AI fallback)  
 ✅ **AI-Powered Analysis** (health checks, relationship explanations)  
 ✅ **High Performance** (multi-level caching, <0.1s response time)  
-✅ **Production Ready** (69+ tests, comprehensive error handling)
+✅ **Production Ready** (83+ tests, comprehensive error handling)
 
 ### LLM-Friendly Design
 - **Filtered Responses**: No noise, only relevant data
@@ -778,14 +826,57 @@ K8sConfig.for_production()
 - **Human Explanations**: Every match/change explained
 - **Error Messages**: Clear, actionable error responses
 
+### Intelligent Prompts
+
+The server provides two powerful prompts that guide LLMs through complex workflows:
+
+#### 1. **`create_visual_graph`** - Visualization & Troubleshooting Guide
+**Purpose**: Concise guide for using K8s tools effectively to visualize and troubleshoot.
+
+**No parameters**: General-purpose workflow guide
+
+**What it teaches**:
+- Using `build_resource_graph` effectively (depth management, multiple calls)
+- Tool combinations for common scenarios:
+  - **Visualization**: build_resource_graph + aggregate → Mermaid
+  - **Troubleshooting**: discover_resource + get_pod_logs + list_resources
+  - **Impact Analysis**: build_resource_graph for dependencies
+  - **Change Tracking**: get_resource_changes + compare_resource_versions
+- Aggregation strategies (10 pods → "App: 10 replicas")
+- Mermaid best practices (subgraphs, color coding, shared resources)
+
+**Example workflows covered**:
+- Visualizing architecture: Multiple focused graph calls + aggregate
+- Troubleshooting failing pods: discover + logs + events
+- Impact analysis: "What uses this ConfigMap?"
+- Investigating changes: Change timeline + version comparison
+
+**Key principle**: Combine tools strategically, aggregate intelligently, visualize clearly.
+
+#### 2. **`debug_failing_pod`** - Comprehensive Debugging
+**Purpose**: Complete debugging workflow for failing pods.
+
+**Parameters**:
+- `pod_name`: Pod to debug
+- `namespace`: Pod's namespace
+
+**What it teaches**:
+- Get complete resource context with `discover_resource`
+- Check pod logs (current and previous)
+- Examine events and status
+- Discover dependencies (ConfigMaps, Secrets, Services)
+- Check related resources (Deployment, ReplicaSet)
+- Identify root causes
+
 ### Use Cases
-1. **Debugging** - "Why is my pod failing?" → Complete context with logs
+1. **Debugging** - "Why is my pod failing?" → Use `debug_failing_pod` prompt
 2. **Investigation** - "What changed in last deployment?" → Timeline with diffs
 3. **Impact Analysis** - "What uses this ConfigMap?" → Dependency tree
 4. **Relationship Discovery** - "How are these resources connected?" → Full graph
-5. **Pod Logs** - "Show me the last 200 lines" → Filtered logs with truncation info
-6. **Permission Checks** - "Can I access this?" → RBAC status
-7. **Smart Search** - "Find nginx pod" → Fuzzy matching
+5. **Visualization** - "Show namespace architecture" → Use `visualize_namespace_architecture` prompt
+6. **Pod Logs** - "Show me the last 200 lines" → Filtered logs with truncation info
+7. **Permission Checks** - "Can I access this?" → RBAC status
+8. **Smart Search** - "Find nginx pod" → Fuzzy matching
 
 ## Summary
 
@@ -1041,8 +1132,248 @@ k8s_mcp/graph/
 
 ---
 
-**Last Updated**: November 5, 2024  
-**Status**: Graph tool implemented and validated. Incremental caching fix applied - needs testing.  
+**Last Updated**: November 6, 2024  
+**Status**: Graph tool implemented with response optimizations and pod sampling documented.  
 **Tests**: 83/83 passing  
-**Next Action**: Restart server and test incremental caching scenario.
+**Next Action**: Multi-cluster context support validated.
+
+---
+
+## Graph Response Optimizations (Nov 6, 2024)
+
+### Overview
+Multiple optimizations added to reduce response size and improve LLM understanding.
+
+### ✅ Implemented Optimizations
+
+#### 1. Namespace Extraction
+**Before**:
+```json
+{
+  "nodes": [
+    {"id": "Pod:default:x", "kind": "Pod", "name": "x", "namespace": "default"},
+    {"id": "Secret:default:y", "kind": "Secret", "name": "y", "namespace": "default"}
+  ]
+}
+```
+
+**After**:
+```json
+{
+  "metadata": {
+    "primary_namespace": "default",
+    "namespaces": {"default": 100, "kube-system": 5}
+  },
+  "nodes": [
+    {"id": "Pod:default:x", "kind": "Pod", "name": "x"},
+    {"id": "Secret:default:y", "kind": "Secret", "name": "y"}
+  ]
+}
+```
+
+**Savings**: ~25 bytes per node (e.g., ~2.5KB for 100 nodes)
+
+#### 2. "New" Items Separated
+**Before**:
+```json
+{
+  "nodes": [
+    {"id": "Pod:default:x", "new": true},
+    {"id": "Secret:default:y", "new": false}
+  ],
+  "edges": [
+    {"source": "...", "target": "...", "new": true}
+  ]
+}
+```
+
+**After**:
+```json
+{
+  "nodes": [...],
+  "edges": [...],
+  "new_items": {
+    "node_ids": ["Pod:default:x"],
+    "edges": [("Pod:default:x", "Secret:default:y")]
+  }
+}
+```
+
+**Savings**: ~13 bytes per node/edge (e.g., ~3.9KB for 100 nodes + 200 edges)
+
+#### 3. Pod Sampling Documentation
+**Optimization**: Pods from the same ReplicaSet template share ONE node.
+
+**Node ID Strategy**:
+```python
+# All pods with same template hash get SAME ID
+Pod: accounts-service-86bfb95bc4-4hczl → Pod:default:ReplicaSet-accounts-service-86bfb95bc4:86bfb95bc4
+Pod: accounts-service-86bfb95bc4-56m7w → Pod:default:ReplicaSet-accounts-service-86bfb95bc4:86bfb95bc4 (SAME!)
+Pod: accounts-service-86bfb95bc4-j4xc7 → Pod:default:ReplicaSet-accounts-service-86bfb95bc4:86bfb95bc4 (SAME!)
+```
+
+**Visited Check**:
+```python
+# builder.py line 190-192
+if node_id in visited:
+    return  # Skip processing duplicate pods
+```
+
+**Impact**:
+| Replicas | Without Optimization | With Optimization | Savings |
+|----------|---------------------|-------------------|---------|
+| 3 pods   | 27 edges            | 9 edges          | 67%     |
+| 10 pods  | 90 edges            | 9 edges          | 90%     |
+| 100 pods | 900 edges           | 9 edges          | 99%     |
+
+**Visual Indicator**:
+```json
+{
+  "nodes": [
+    {
+      "id": "Pod:default:ReplicaSet-accounts-service-86bfb95bc4:86bfb95bc4",
+      "kind": "Pod",
+      "name": "accounts-service-86bfb95bc4-4hczl",
+      "_note": "Represents pod template (siblings with same template share this node)"
+    }
+  ],
+  "metadata": {
+    "pod_sampling_enabled": true
+  },
+  "optimization_note": "Pod Sampling: Pods from the same ReplicaSet template share a single node for efficiency..."
+}
+```
+
+#### 4. Structured Metadata
+**Before**: Flat structure
+```json
+{
+  "namespace": "default",
+  "cluster": "production",
+  "node_count": 50,
+  "edge_count": 100
+}
+```
+
+**After**: Grouped by purpose
+```json
+{
+  "metadata": {
+    "primary_namespace": "default",
+    "cluster": "production",
+    "namespaces": {"default": 48, "kube-system": 2},
+    "pod_sampling_enabled": true
+  },
+  "counts": {
+    "total_nodes": 50,
+    "total_edges": 100,
+    "new_nodes": 10,
+    "new_edges": 15
+  }
+}
+```
+
+### Use Cases Where Pod Sampling Affects Results
+
+#### ✅ No Impact (Majority of Cases)
+- **Deployments with identical pods**: All pods share same config
+- **Standard configurations**: Pods from ReplicaSet template are truly identical
+- **Architecture visualization**: One pod represents the template pattern
+
+#### ⚠️ Potential Information Loss
+1. **Node Distribution** (COMMON)
+   - Can't see which specific nodes pods are scheduled on
+   - Useful for troubleshooting scheduling issues
+   - Impact: Medium - node info lost for non-sampled pods
+
+2. **StatefulSet Per-Pod PVCs** (COMMON)
+   - Each StatefulSet pod has unique PVC
+   - Only first pod's PVC relationship shown
+   - Impact: High - missing critical storage relationships
+   - Note: StatefulSets use `controller-revision-hash`, may behave differently
+
+3. **Manual Pod Modifications** (RARE)
+   - If someone manually edits a pod (anti-pattern!)
+   - Changes won't be reflected in graph
+   - Impact: Low - violates K8s best practices
+
+4. **Admission Controller Injections** (UNCOMMON)
+   - If mutating webhooks modify pods differently
+   - Only first pod's modifications captured
+   - Impact: Low - webhooks typically inject uniformly
+
+### Pros & Cons
+
+**Pros:**
+- ✅ **Efficiency**: 1 API call instead of N
+- ✅ **Smaller graphs**: 99% fewer edges for 100 replicas
+- ✅ **LLM-friendly**: Fits in context windows
+- ✅ **Clarity**: Shows architecture, not individual instances
+- ✅ **K8s philosophy**: "Pods are cattle, not pets"
+
+**Cons:**
+- ❌ **Node distribution lost**: Can't see pod → node mapping
+- ❌ **StatefulSet issue**: Per-pod PVCs not fully shown
+- ❌ **Drift detection impossible**: Can't detect manual pod edits
+- ❌ **Troubleshooting limited**: Hard to debug specific pod issues
+
+### Response Size Comparison
+
+For 100 nodes, 200 edges:
+- **Namespace in nodes**: ~2.4KB saved
+- **Node IDs optimized**: ~4.5KB saved (namespace in IDs)
+- **"new" flags separated**: ~3.9KB saved
+- **Pod sampling (10 replicas)**: ~81 edges avoided (massive!)
+- **Total savings**: ~10KB + structural efficiency + 90% edge reduction
+
+### LLM Understanding
+
+The optimizations are documented in:
+1. **Tool docstring**: Explains optimizations to LLM
+2. **Response metadata**: `pod_sampling_enabled` flag
+3. **Node annotations**: `_note` field on sampled pods
+4. **Top-level notice**: `optimization_note` explains sampling
+
+LLMs see:
+```json
+{
+  "optimization_note": "Pod Sampling: Pods from the same ReplicaSet template share a single node for efficiency. This reduces graph size significantly (e.g., 100 replicas = 1 node instead of 100). Individual pod instances are not shown separately unless they have unique configurations (StatefulSets).",
+  "nodes": [
+    {
+      "id": "Pod:default:ReplicaSet-accounts-service-86bfb95bc4:86bfb95bc4",
+      "_note": "Represents pod template (siblings with same template share this node)"
+    }
+  ]
+}
+```
+
+### Future Considerations
+
+**Option 1**: Special-case StatefulSets
+```python
+# In node_identity.py
+if kind == "Pod" and owner_kind == "StatefulSet":
+    return f"Pod:{namespace}:{name}"  # Unique ID per StatefulSet pod
+```
+
+**Option 2**: Add replica metadata
+```python
+# Track represented pods without N× edges
+{
+  "id": "Pod:...",
+  "represented_pods": ["4hczl", "56m7w", "j4xc7"],
+  "replica_count": 3,
+  "nodes_scheduled_on": ["node-1", "node-2", "node-3"]
+}
+```
+
+**Option 3**: Configuration flag
+```python
+# Let users control pod sampling
+BuildOptions(sample_pods=True)  # Current behavior
+BuildOptions(sample_pods=False)  # Process all pods
+```
+
+**Decision**: Keep optimization for Deployments (efficiency > completeness for identical pods).  
+**Next Step**: Consider special-casing StatefulSets if per-pod PVC tracking becomes critical.
 

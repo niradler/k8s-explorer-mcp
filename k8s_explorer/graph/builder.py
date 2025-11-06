@@ -27,6 +27,8 @@ class GraphBuilder:
             "nodes_processed": 0,
             "edges_added": 0,
         }
+        self.pod_template_representatives = {}
+        self.pod_shared_resources = {}
 
     async def build_from_resource(
         self, resource_id: ResourceIdentifier, depth: int, options: BuildOptions
@@ -39,6 +41,8 @@ class GraphBuilder:
             "nodes_processed": 0,
             "edges_added": 0,
         }
+        self.pod_template_representatives = {}
+        self.pod_shared_resources = {}
 
         # Get cached graph to check for existing nodes
         namespace = resource_id.namespace or "cluster"
@@ -68,6 +72,8 @@ class GraphBuilder:
     ) -> nx.DiGraph:
         graph = nx.DiGraph()
         self.permission_errors = []
+        self.pod_template_representatives = {}
+        self.pod_shared_resources = {}
 
         # Get cached graph to check for existing nodes
         cluster_id = options.cluster_id or "default"
@@ -195,6 +201,17 @@ class GraphBuilder:
         node_attrs = self.node_identity.extract_node_attributes(resource)
         if build_options.cluster_id:
             node_attrs["cluster_id"] = build_options.cluster_id
+        
+        is_pod = resource.get("kind") == "Pod"
+        template_id = self.node_identity.get_pod_template_id(resource) if is_pod else None
+        is_first_pod_of_template = False
+        
+        if template_id:
+            if template_id not in self.pod_template_representatives:
+                self.pod_template_representatives[template_id] = node_id
+                is_first_pod_of_template = True
+            else:
+                self.pod_shared_resources[node_id] = []
 
         # Check for ANY duplicate node with same kind/namespace/name that we need to migrate
         metadata = resource.get("metadata", {})
@@ -256,6 +273,13 @@ class GraphBuilder:
         neighbor_tasks = []
         for rel in relationships:
             target_node_id = self._get_node_id_from_identifier(rel.target)
+            
+            is_shared_resource = rel.relationship_type.value in ["volume", "env_from", "reference"]
+            is_unique_node_relationship = rel.target.kind == "Node"
+            
+            if template_id and not is_first_pod_of_template and is_shared_resource and not is_unique_node_relationship:
+                self.pod_shared_resources[node_id].append(target_node_id)
+                continue
 
             # Check if a canonical node for this resource already exists
             # First check cached graph, then current subgraph
@@ -303,7 +327,6 @@ class GraphBuilder:
                     kind=rel.target.kind,
                     name=rel.target.name,
                     namespace=rel.target.namespace,
-                    new=False,  # Placeholder node, might be filled in later
                 )
 
             if not graph.has_edge(node_id, target_node_id):
@@ -339,6 +362,9 @@ class GraphBuilder:
 
     def get_discovery_stats(self) -> dict:
         return self.discovery_stats.copy()
+    
+    def get_pod_shared_resources(self) -> dict:
+        return self.pod_shared_resources.copy()
 
     def validate_graph(self, graph: nx.DiGraph) -> dict:
         """

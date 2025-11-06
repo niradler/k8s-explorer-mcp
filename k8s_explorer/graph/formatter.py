@@ -18,17 +18,25 @@ class GraphFormatter:
         merge_result: GraphMergeResult,
         metadata: GraphMetadata,
         permission_notices: List[str] = None,
+        pod_shared_resources: dict = None,
     ) -> Dict[str, Any]:
         nodes = []
+        namespace_counts = defaultdict(int)
+        pod_shared_resources = pod_shared_resources or {}
+        
         for node_id, data in graph.nodes(data=True):
+            ns = data.get("namespace", "cluster")
+            namespace_counts[ns] += 1
+            
             node_dict = {
                 "id": node_id,
                 "kind": data.get("kind"),
                 "name": data.get("name"),
-                "namespace": data.get("namespace"),
-                "new": node_id in merge_result.new_nodes,
             }
-
+            
+            if node_id in pod_shared_resources:
+                node_dict["shared_resources"] = pod_shared_resources[node_id]
+            
             if "status" in data:
                 node_dict["status"] = data["status"]
             if "ready" in data:
@@ -46,7 +54,6 @@ class GraphFormatter:
                 "source": src,
                 "target": tgt,
                 "relationship": data.get("relationship_type"),
-                "new": (src, tgt) in merge_result.new_edges,
             }
 
             if "details" in data:
@@ -62,28 +69,29 @@ class GraphFormatter:
 
         summary = GraphFormatter._create_summary(query_info, merge_result, metadata, resource_types)
 
+        cache_exists = metadata.query_count > 0
+        
         result = {
             "query": query_info,
-            "namespace": metadata.namespace,
-            "cluster": metadata.cluster_id,
-            "node_count": merge_result.total_nodes,
-            "edge_count": merge_result.total_edges,
-            "new_nodes": len(merge_result.new_nodes),
-            "new_edges": len(merge_result.new_edges),
+            "metadata": {
+                "primary_namespace": metadata.namespace,
+                "cluster": metadata.cluster_id,
+                "namespaces": dict(namespace_counts),
+                "cache_hit": cache_exists,
+            },
+            "counts": {
+                "total_nodes": merge_result.total_nodes,
+                "total_edges": merge_result.total_edges,
+            },
             "resource_types": dict(resource_types),
             "nodes": nodes[:500],
             "edges": edges[:1000],
             "summary": summary,
             "cache_info": {
-                "namespace_graph_exists": True,
-                "graph_age_seconds": int(metadata.last_updated - metadata.created_at),
-                "total_queries": metadata.query_count,
-                "last_updated": metadata.last_updated,
-            },
-            "debug": {
-                "graph_nodes": graph.number_of_nodes(),
-                "graph_edges": graph.number_of_edges(),
-                "subgraph_was_processed": True,
+                "exists": cache_exists,
+                "age_seconds": int(metadata.last_updated - metadata.created_at) if cache_exists else 0,
+                "query_count": metadata.query_count,
+                "last_updated": metadata.last_updated if cache_exists else None,
             },
         }
 

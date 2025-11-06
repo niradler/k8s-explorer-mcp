@@ -38,25 +38,6 @@ class NodeIdentity:
         name = metadata.get("name")
         namespace = metadata.get("namespace", "cluster")
 
-        if kind == "Pod":
-            owner_refs = metadata.get("ownerReferences", [])
-            if owner_refs:
-                owner = owner_refs[0]
-                owner_kind = owner.get("kind")
-                owner_name = owner.get("name")
-
-                template_hash = metadata.get("labels", {}).get("pod-template-hash", "")
-                if template_hash:
-                    return f"Pod:{namespace}:{owner_kind}-{owner_name}:{template_hash}"
-
-                controller_revision = metadata.get("labels", {}).get("controller-revision-hash", "")
-                if controller_revision:
-                    return f"Pod:{namespace}:{owner_kind}-{owner_name}:{controller_revision}"
-
-                return f"Pod:{namespace}:{owner_kind}-{owner_name}:managed"
-
-            return f"Pod:{namespace}:{name}"
-
         if kind == "ReplicaSet":
             pod_template_hash = metadata.get("labels", {}).get("pod-template-hash", "")
             owner_refs = metadata.get("ownerReferences", [])
@@ -65,6 +46,31 @@ class NodeIdentity:
                 return f"ReplicaSet:{namespace}:{owner.get('name')}:{pod_template_hash}"
 
         return f"{kind}:{namespace}:{name}"
+    
+    @staticmethod
+    def get_pod_template_id(resource: Dict[str, Any]) -> str:
+        """Get template identifier for pods from same ReplicaSet/StatefulSet."""
+        if resource.get("kind") != "Pod":
+            return None
+        
+        metadata = resource.get("metadata", {})
+        namespace = metadata.get("namespace", "cluster")
+        owner_refs = metadata.get("ownerReferences", [])
+        
+        if owner_refs:
+            owner = owner_refs[0]
+            owner_kind = owner.get("kind")
+            owner_name = owner.get("name")
+            
+            template_hash = metadata.get("labels", {}).get("pod-template-hash", "")
+            if template_hash:
+                return f"PodTemplate:{namespace}:{owner_kind}-{owner_name}:{template_hash}"
+            
+            controller_revision = metadata.get("labels", {}).get("controller-revision-hash", "")
+            if controller_revision:
+                return f"PodTemplate:{namespace}:{owner_kind}-{owner_name}:{controller_revision}"
+        
+        return None
 
     @staticmethod
     def get_stable_resources() -> List[str]:

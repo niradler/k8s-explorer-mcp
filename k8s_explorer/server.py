@@ -22,6 +22,7 @@ from k8s_explorer.graph import BuildOptions, GraphBuilder, GraphCache, GraphForm
 from k8s_explorer.models import ResourceIdentifier
 from k8s_explorer.operators.crd_handlers import CRDOperatorRegistry
 from k8s_explorer.relationships import RelationshipDiscovery
+from k8s_explorer import prompts
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -785,7 +786,7 @@ async def build_resource_graph(
     namespace: str,
     kind: Optional[str] = None,
     name: Optional[str] = None,
-    depth: int = 3,
+    depth: int = 6,
     include_rbac: bool = True,
     include_network: bool = True,
     include_crds: bool = True,
@@ -806,10 +807,20 @@ async def build_resource_graph(
         kind: Optional resource kind to start from (Deployment, Pod, Service, any CRD, etc.)
               If omitted, builds graph for entire namespace
         name: Optional resource name (required if kind specified)
-        depth: How many relationship hops to traverse (default: 3)
-               depth=1: immediate neighbors only
-               depth=2: neighbors + their neighbors
-               depth=3: 3 levels out (recommended for full context)
+        depth: Expansion depth - how many levels to recursively fetch neighbors (default: 6)
+               Controls graph SIZE by limiting recursive fetches, NOT relationship visibility.
+               
+               depth=1: Fetch only the starting resource + its immediate neighbors
+               depth=2: Fetch resource + neighbors + their neighbors (recommended for focused queries)
+               depth=6: Deep exploration (default, good for complete context)
+               
+               Example with depth=2 starting from Deployment:
+               - Fetches: Deployment (depth=2) → ReplicaSet (depth=1) → Pod (depth=0)
+               - Shows edges: Deployment→RS→Pod→ConfigMap (ConfigMap NOT fetched, just referenced)
+               - Result: 3 fetched resources, 4 visible in graph (ConfigMap as placeholder)
+               
+               Higher depth = more resources fetched = larger graphs but more complete context.
+               
         include_rbac: Include RBAC relationships (ServiceAccounts, Roles, RoleBindings)
         include_network: Include NetworkPolicy relationships
         include_crds: Include CRD/Operator relationships (Airflow, ArgoCD, Helm, etc.)
@@ -818,6 +829,13 @@ async def build_resource_graph(
 
     Returns:
         Graph in LLM-friendly format with merged namespace graph.
+
+    Response Optimizations:
+        - Namespace is extracted to metadata (not repeated in each node)
+        - "new" items listed separately instead of boolean on each item
+        - Pod Sampling: Pods from same ReplicaSet template share ONE node for efficiency
+          (e.g., 100 replicas = 1 node instead of 100, reducing edges by 99x)
+        - Node IDs contain full context (kind:namespace:name) for clarity
 
     Examples:
         Specific resource entry:
@@ -883,6 +901,7 @@ async def build_resource_graph(
             query_info["name"] = name
 
         permission_notices = graph_builder.get_permission_notices()
+        pod_shared_resources = graph_builder.get_pod_shared_resources()
 
         result = GraphFormatter.to_llm_dict(
             full_graph,
@@ -890,13 +909,16 @@ async def build_resource_graph(
             merge_result,
             metadata,
             permission_notices if permission_notices else None,
+            pod_shared_resources,
         )
 
-        result["debug"]["permission_errors_count"] = len(permission_notices)
-        result["debug"]["subgraph_nodes"] = subgraph.number_of_nodes()
-        result["debug"]["subgraph_edges"] = subgraph.number_of_edges()
-        result["debug"]["discovery_stats"] = graph_builder.get_discovery_stats()
-        result["debug"]["validation"] = validation
+        result["debug"] = {
+            "permission_errors_count": len(permission_notices),
+            "subgraph_nodes": subgraph.number_of_nodes(),
+            "subgraph_edges": subgraph.number_of_edges(),
+            "discovery_stats": graph_builder.get_discovery_stats(),
+            "validation": validation,
+        }
 
         # Add validation issues to main response if found
         if validation["issues"]:
@@ -911,70 +933,9 @@ async def build_resource_graph(
         return {"error": str(e)}
 
 
-@mcp.prompt()
-async def debug_failing_pod(pod_name: str, namespace: str = "default") -> PromptResult:
-    """
-    Generate a comprehensive debugging workflow for a failing Kubernetes pod.
-
-    This prompt guides you through a complete pod debugging session including:
-    - Complete context discovery with all dependencies
-    - ConfigMaps and Secrets analysis
-    - Recent logs retrieval
-    - Change history to identify what triggered the failure
-    - Full dependency tree visualization
-
-    Args:
-        pod_name: Name of the failing pod (supports fuzzy matching)
-        namespace: Kubernetes namespace where the pod is located
-
-    Returns:
-        A structured debugging workflow prompt
-    """
-    return [
-        Message(
-            f"""I need to debug a failing pod in Kubernetes. Please help me investigate systematically.
-
-**Pod Details:**
-- Name: {pod_name}
-- Namespace: {namespace}
-
-**Investigation Steps:**
-
-1. **Get Complete Context** - Use `discover_resource` with depth="complete" to understand:
-   - What ConfigMaps and Secrets the pod uses
-   - Parent resources (Deployment, ReplicaSet, StatefulSet)
-   - Whether it's managed by Helm, ArgoCD, or other operators
-   - All dependencies and relationships
-
-2. **Check Pod Logs** - Use `get_pod_logs` with:
-   - tail=200 to see recent activity
-   - Note: The tool handles fuzzy matching if the pod was recreated with a new suffix
-   - Automatically detects single containers or prompts for container name
-
-3. **Investigate Recent Changes** - Use `get_resource_changes` on the parent Deployment/StatefulSet:
-   - Look for configuration changes that might have caused the failure
-   - Check for image updates, resource limit changes, or environment variable modifications
-   - max_versions=5 to see recent history
-
-4. **Visualize Dependencies** - Use `build_resource_graph` to:
-   - See the full dependency tree
-   - Identify any missing or misconfigured dependencies
-   - Check if related resources are healthy
-
-5. **Analyze and Report** - Based on the findings:
-   - Identify the root cause
-   - Suggest specific remediation steps
-   - Highlight any configuration issues or missing resources
-
-**Important Notes:**
-- The pod name supports fuzzy matching, so if the pod was recreated with a new suffix, the tools will find it automatically
-- All tools are permission-aware and will indicate if access is limited
-- Focus on actionable insights and specific fixes
-
-Please execute this investigation step by step and provide a comprehensive analysis.""",
-            role="user",
-        )
-    ]
+# Register prompts from prompts.py
+mcp.prompt()(prompts.create_visual_graph)
+mcp.prompt()(prompts.debug_failing_pod)
 
 
 def main():
