@@ -1,0 +1,13 @@
+{
+  "entrypoint": "k8s_explorer/server.py",
+  "environment": {
+    "dependencies": [
+      "kubernetes>=34.1.0",
+      "cachetools>=6.2.1",
+      "pydantic>=2.12.4",
+      "aiohttp>=3.13.2",
+      "networkx>=3.5"
+    ]
+  }
+}
+
