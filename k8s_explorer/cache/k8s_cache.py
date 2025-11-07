@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from cachetools import TTLCache
 
-from .models import CacheKey, ResourceIdentifier
+from ..models import CacheKey, ResourceIdentifier
 
 logger = logging.getLogger(__name__)
 

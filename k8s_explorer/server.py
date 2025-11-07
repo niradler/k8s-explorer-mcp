@@ -13,12 +13,16 @@ from typing import Dict, List, Optional
 
 from fastmcp import FastMCP
 from fastmcp.prompts.prompt import Message, PromptResult
+from k8s_graph import GraphBuilder as K8sGraphBuilder, BuildOptions as K8sGraphBuildOptions
+from k8s_graph.discoverers import DiscovererRegistry
+from k8s_graph.validator import validate_graph
 
-from k8s_explorer.cache import K8sCache
+from k8s_explorer.adapters import K8sGraphClientAdapter, CRDDiscovererAdapter
+from k8s_explorer.cache import K8sCache, GraphCache
 from k8s_explorer.changes import DeploymentHistoryTracker, ResourceDiffer
 from k8s_explorer.client import K8sClient
 from k8s_explorer.filters import ResponseFilter
-from k8s_explorer.graph import BuildOptions, GraphBuilder, GraphCache, GraphFormatter
+from k8s_explorer.formatters import GraphResponseFormatter
 from k8s_explorer.models import ResourceIdentifier
 from k8s_explorer.operators.crd_handlers import CRDOperatorRegistry
 from k8s_explorer.relationships import RelationshipDiscovery
@@ -61,7 +65,8 @@ Kubernetes resource explorer with intelligent caching and multi-cluster support.
 
 k8s_clients: Dict[str, K8sClient] = {}
 relationship_discoveries: Dict[str, RelationshipDiscovery] = {}
-graph_builders: Dict[str, GraphBuilder] = {}
+graph_builders: Dict[str, K8sGraphBuilder] = {}
+k8s_graph_adapters: Dict[str, K8sGraphClientAdapter] = {}
 crd_registry: Optional[CRDOperatorRegistry] = None
 response_filter: Optional[ResponseFilter] = None
 graph_cache: Optional[GraphCache] = None
@@ -77,7 +82,7 @@ def _ensure_initialized(context: Optional[str] = None):
     Returns:
         Tuple of (k8s_client, relationship_discovery, graph_builder)
     """
-    global k8s_clients, relationship_discoveries, graph_builders
+    global k8s_clients, relationship_discoveries, graph_builders, k8s_graph_adapters
     global crd_registry, response_filter, graph_cache, shared_cache
 
     if shared_cache is None:
@@ -96,8 +101,16 @@ def _ensure_initialized(context: Optional[str] = None):
         k8s_client = K8sClient(cache=shared_cache, context=context)
         k8s_clients[ctx_key] = k8s_client
         relationship_discoveries[ctx_key] = RelationshipDiscovery(k8s_client)
-        graph_builders[ctx_key] = GraphBuilder(k8s_client, graph_cache)
-        logger.info(f"Kubernetes client initialized successfully for context: {k8s_client.context}")
+        
+        k8s_graph_adapter = K8sGraphClientAdapter(k8s_client)
+        k8s_graph_adapters[ctx_key] = k8s_graph_adapter
+        
+        registry = DiscovererRegistry.get_global()
+        crd_adapter = CRDDiscovererAdapter(k8s_graph_adapter, crd_registry)
+        registry.register(crd_adapter)
+        
+        graph_builders[ctx_key] = K8sGraphBuilder(k8s_graph_adapter)
+        logger.info(f"Kubernetes client and k8s-graph initialized successfully for context: {k8s_client.context}")
     
     return k8s_clients[ctx_key], relationship_discoveries[ctx_key], graph_builders[ctx_key]
 
@@ -408,7 +421,7 @@ async def discover_resource(
             return result
 
         elif depth == "tree":
-            tree = await relationship_discovery.build_resource_tree(resource_id, max_depth=3)
+            tree = await relationship_discovery.build_resource_tree(resource_id, max_depth=5)
 
             if not tree:
                 return {"error": f"Resource not found: {kind}/{name} in {namespace}"}
@@ -781,6 +794,213 @@ async def compare_resource_versions(
         return {"error": str(e)}
 
 
+async def _enrich_graph_with_status(graph: "nx.DiGraph", k8s_client, namespace: str):
+    """
+    Enrich graph nodes with status information for debugging.
+    
+    Batches API calls by resource type for efficiency.
+    
+    Adds status for:
+    - Pods: phase (Running, Pending, Failed, etc.)
+    - Deployments: ready/desired replicas
+    - Services: type (ClusterIP, LoadBalancer, etc.)
+    - ReplicaSets: ready/desired replicas
+    """
+    import networkx as nx
+    from collections import defaultdict
+    
+    # Only enrich resource types we know the client supports and we have logic for
+    ENRICHABLE_KINDS = {
+        "Pod", "Deployment", "ReplicaSet", "StatefulSet", "DaemonSet",
+        "Service", "ConfigMap", "Secret", "Node", "PersistentVolumeClaim"
+    }
+    
+    nodes_by_kind = defaultdict(list)
+    for node_id, data in graph.nodes(data=True):
+        if "status" not in data:  # Only enrich if missing
+            kind = data.get("kind")
+            if kind and kind in ENRICHABLE_KINDS:
+                nodes_by_kind[kind].append((node_id, data))
+    
+    if not nodes_by_kind:
+        logger.debug("All nodes already have status information")
+        return
+    
+    total_nodes = sum(len(nodes) for nodes in nodes_by_kind.values())
+    logger.info(f"Enriching {total_nodes} nodes across {len(nodes_by_kind)} resource types with status information")
+    
+    try:
+        for kind, nodes in nodes_by_kind.items():
+            try:
+                # Batch fetch all resources of this kind
+                # list_resources returns (resources, permission_notice) tuple
+                resources, _ = await k8s_client.list_resources(
+                    kind=kind,
+                    namespace=namespace
+                )
+                
+                # Create lookup map: name -> resource
+                resource_map = {}
+                for resource in resources:
+                    name = resource.get("metadata", {}).get("name")
+                    if name:
+                        resource_map[name] = resource
+                
+                logger.debug(f"Enriching {len(nodes)} {kind}(s): found {len(resource_map)} resources from API")
+                
+                # Enrich all nodes of this kind
+                enriched_count = 0
+                for node_id, data in nodes:
+                    name = data.get("name")
+                    resource = resource_map.get(name)
+                    
+                    if not resource:
+                        continue
+                    
+                    enriched_count += 1
+                    
+                    # Add status based on resource type (use explicit graph.nodes API)
+                    if kind == "Pod":
+                        status = resource.get("status", {})
+                        graph.nodes[node_id]["status"] = status.get("phase", "Unknown")
+                        
+                        # Count ready containers
+                        container_statuses = status.get("containerStatuses", [])
+                        ready_count = sum(1 for cs in container_statuses if cs.get("ready", False))
+                        total_count = len(container_statuses)
+                        graph.nodes[node_id]["ready"] = f"{ready_count}/{total_count}" if total_count > 0 else "0/0"
+                    
+                    elif kind in ["Deployment", "ReplicaSet", "StatefulSet", "DaemonSet"]:
+                        status = resource.get("status", {})
+                        spec = resource.get("spec", {})
+                        
+                        if kind == "Deployment":
+                            ready_replicas = status.get("readyReplicas", 0)
+                            desired_replicas = spec.get("replicas", 0)
+                            graph.nodes[node_id]["replicas"] = f"{ready_replicas}/{desired_replicas}"
+                            graph.nodes[node_id]["ready"] = ready_replicas == desired_replicas
+                        elif kind == "ReplicaSet":
+                            ready_replicas = status.get("readyReplicas", 0)
+                            desired_replicas = status.get("replicas", 0)
+                            graph.nodes[node_id]["replicas"] = f"{ready_replicas}/{desired_replicas}"
+                            graph.nodes[node_id]["ready"] = ready_replicas == desired_replicas
+                        elif kind == "StatefulSet":
+                            ready_replicas = status.get("readyReplicas", 0)
+                            desired_replicas = spec.get("replicas", 0)
+                            graph.nodes[node_id]["replicas"] = f"{ready_replicas}/{desired_replicas}"
+                            graph.nodes[node_id]["ready"] = ready_replicas == desired_replicas
+                        elif kind == "DaemonSet":
+                            desired = status.get("desiredNumberScheduled", 0)
+                            ready = status.get("numberReady", 0)
+                            graph.nodes[node_id]["replicas"] = f"{ready}/{desired}"
+                            graph.nodes[node_id]["ready"] = ready == desired
+                    
+                    elif kind == "Service":
+                        spec = resource.get("spec", {})
+                        graph.nodes[node_id]["type"] = spec.get("type", "ClusterIP")
+                        graph.nodes[node_id]["status"] = "Active"
+                    
+                    elif kind in ["ConfigMap", "Secret"]:
+                        graph.nodes[node_id]["status"] = "Active"
+                
+                logger.debug(f"Enriched {enriched_count}/{len(nodes)} {kind}(s) with status")
+                
+            except Exception as e:
+                logger.warning(f"Could not enrich {kind} nodes: {e}")
+                continue
+    
+    except Exception as e:
+        logger.error(f"Error enriching graph with status: {e}", exc_info=True)
+
+
+async def _discover_reverse_dependencies(graph, k8s_client, resource_kind: str, resource_name: str, namespace: str):
+    """
+    Discover resources that use a specific Secret, ConfigMap, Service, or PVC.
+    
+    This adds reverse dependency edges to the graph for resources that weren't
+    discovered through forward traversal.
+    """
+    import networkx as nx
+    
+    resource_id = f"{resource_kind}:{namespace}:{resource_name}"
+    
+    if resource_id not in graph:
+        logger.warning(f"Resource {resource_id} not in graph, skipping reverse dependency discovery")
+        return
+    
+    try:
+        # list_resources returns (resources, permission_notice) tuple
+        pods, _ = await k8s_client.list_resources(kind="Pod", namespace=namespace)
+        
+        for pod in pods:
+            pod_name = pod.get("metadata", {}).get("name")
+            pod_namespace = pod.get("metadata", {}).get("namespace", namespace)
+            pod_id = f"Pod:{pod_namespace}:{pod_name}"
+            
+            references_resource = False
+            relationship_type = "unknown"
+            relationship_details = ""
+            
+            if resource_kind in ["Secret", "ConfigMap"]:
+                spec = pod.get("spec", {})
+                
+                for volume in spec.get("volumes", []):
+                    if resource_kind == "Secret" and volume.get("secret", {}).get("secretName") == resource_name:
+                        references_resource = True
+                        relationship_type = "volume"
+                        relationship_details = f"Mounts {resource_kind} as volume '{volume.get('name')}'"
+                        break
+                    elif resource_kind == "ConfigMap" and volume.get("configMap", {}).get("name") == resource_name:
+                        references_resource = True
+                        relationship_type = "volume"
+                        relationship_details = f"Mounts {resource_kind} as volume '{volume.get('name')}'"
+                        break
+                
+                if not references_resource:
+                    for container in spec.get("containers", []) + spec.get("initContainers", []):
+                        for env in container.get("env", []):
+                            value_from = env.get("valueFrom", {})
+                            if resource_kind == "Secret" and value_from.get("secretKeyRef", {}).get("name") == resource_name:
+                                references_resource = True
+                                relationship_type = "env_var"
+                                relationship_details = f"Container '{container.get('name')}' uses {resource_kind} key for env var"
+                                break
+                            elif resource_kind == "ConfigMap" and value_from.get("configMapKeyRef", {}).get("name") == resource_name:
+                                references_resource = True
+                                relationship_type = "env_var"
+                                relationship_details = f"Container '{container.get('name')}' uses {resource_kind} key for env var"
+                                break
+                        
+                        for env_from in container.get("envFrom", []):
+                            if resource_kind == "Secret" and env_from.get("secretRef", {}).get("name") == resource_name:
+                                references_resource = True
+                                relationship_type = "env_from"
+                                relationship_details = f"Container '{container.get('name')}' loads all {resource_kind} keys"
+                                break
+                            elif resource_kind == "ConfigMap" and env_from.get("configMapRef", {}).get("name") == resource_name:
+                                references_resource = True
+                                relationship_type = "env_from"
+                                relationship_details = f"Container '{container.get('name')}' loads all {resource_kind} keys"
+                                break
+            
+            if references_resource:
+                if pod_id not in graph:
+                    graph.add_node(pod_id, 
+                                 kind="Pod", 
+                                 name=pod_name, 
+                                 namespace=pod_namespace,
+                                 status=pod.get("status", {}).get("phase", "Unknown"))
+                
+                if not graph.has_edge(pod_id, resource_id):
+                    graph.add_edge(pod_id, resource_id, 
+                                 relationship_type=relationship_type,
+                                 details=relationship_details)
+                    logger.debug(f"Added reverse dependency: {pod_id} -> {resource_id} ({relationship_type})")
+    
+    except Exception as e:
+        logger.error(f"Error discovering reverse dependencies: {e}", exc_info=True)
+
+
 @mcp.tool()
 async def build_resource_graph(
     namespace: str,
@@ -854,82 +1074,531 @@ async def build_resource_graph(
             return {"error": "name is required when kind is specified"}
 
         cluster = cluster_id or context or "default"
+        
+        cached_graph = graph_cache.get(cluster, namespace)
+        if cached_graph and not (kind and name):
+            cache_meta = graph_cache.get_metadata(cluster, namespace)
+            logger.info(f"Using cached graph for {namespace} (age: {cache_meta['age_seconds']}s)")
+            
+            query_mode = "full_namespace"
+            validation_result = validate_graph(cached_graph)
+            
+            return GraphResponseFormatter.format_for_llm(
+                cached_graph,
+                query_mode=query_mode,
+                namespace=namespace,
+                cluster=cluster,
+                depth=depth,
+                validation_result=validation_result,
+            )
 
-        build_options = BuildOptions(
+        build_options = K8sGraphBuildOptions(
             include_rbac=include_rbac,
             include_network=include_network,
             include_crds=include_crds,
             max_nodes=500,
-            cluster_id=cluster,
         )
 
         if kind and name:
             query_mode = "specific_resource"
-            resource_id = ResourceIdentifier(kind=kind, name=name, namespace=namespace)
+            from k8s_graph.models import ResourceIdentifier as K8sGraphResourceId
+            resource_id = K8sGraphResourceId(kind=kind, name=name, namespace=namespace)
 
             logger.info(f"Building graph from {kind}/{name} in namespace {namespace}")
-            subgraph = await graph_builder.build_from_resource(resource_id, depth, build_options)
+            graph = await graph_builder.build_from_resource(resource_id, depth, build_options)
+            
+            if kind in ["Secret", "ConfigMap", "Service", "PersistentVolumeClaim"]:
+                logger.info(f"Discovering reverse dependencies for {kind}/{name}")
+                await _discover_reverse_dependencies(graph, k8s_client, kind, name, namespace)
         else:
             query_mode = "full_namespace"
             logger.info(f"Building full namespace graph for {namespace}")
-            subgraph = await graph_builder.build_namespace_graph(namespace, depth, build_options)
+            graph = await graph_builder.build_namespace_graph(namespace, depth, build_options)
+        
+        # Enrich graph with status information for all nodes
+        logger.info(f"Enriching graph with status information...")
+        await _enrich_graph_with_status(graph, k8s_client, namespace)
+        
+        graph_cache.set(cluster, namespace, graph)
 
-        merge_result = graph_cache.merge_subgraph(namespace, cluster, subgraph)
-
-        cached = graph_cache.get_namespace_graph(namespace, cluster)
-        if cached:
-            full_graph, metadata = cached
-        else:
-            logger.error("Failed to retrieve merged graph from cache")
-            return {"error": "Failed to retrieve merged graph"}
-
-        # Validate graph for duplicates and issues
-        validation = graph_builder.validate_graph(full_graph)
-
-        if not validation["valid"]:
-            logger.warning(f"Graph validation found issues: {validation['issues']}")
-
-        query_info = {
-            "mode": query_mode,
-            "namespace": namespace,
-            "cluster": cluster,
-            "depth": depth,
-        }
-
-        if query_mode == "specific_resource":
-            query_info["kind"] = kind
-            query_info["name"] = name
-
-        permission_notices = graph_builder.get_permission_notices()
-        pod_shared_resources = graph_builder.get_pod_shared_resources()
-
-        result = GraphFormatter.to_llm_dict(
-            full_graph,
-            query_info,
-            merge_result,
-            metadata,
-            permission_notices if permission_notices else None,
-            pod_shared_resources,
+        validation_result = validate_graph(graph)
+        
+        result = GraphResponseFormatter.format_for_llm(
+            graph,
+            query_mode=query_mode,
+            namespace=namespace,
+            cluster=cluster,
+            kind=kind,
+            name=name,
+            depth=depth,
+            validation_result=validation_result,
         )
-
-        result["debug"] = {
-            "permission_errors_count": len(permission_notices),
-            "subgraph_nodes": subgraph.number_of_nodes(),
-            "subgraph_edges": subgraph.number_of_edges(),
-            "discovery_stats": graph_builder.get_discovery_stats(),
-            "validation": validation,
-        }
-
-        # Add validation issues to main response if found
-        if validation["issues"]:
-            result["validation_issues"] = validation["issues"]
-        if validation["warnings"]:
-            result["validation_warnings"] = validation["warnings"]
 
         return result
 
     except Exception as e:
         logger.error(f"Error building resource graph: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def query_resource_graph(
+    namespace: str,
+    resource_kind: Optional[str] = None,
+    resource_name: Optional[str] = None,
+    filter_by: Optional[str] = None,
+    filter_value: Optional[str] = None,
+    find_path: bool = False,
+    from_resource: Optional[str] = None,
+    to_resource: Optional[str] = None,
+    max_depth: int = 5,
+    context: Optional[str] = None
+) -> dict:
+    """
+    Query cached resource graph for fast lookups without rebuilding.
+    
+    Query Modes:
+    1. Filter by kind: Get all resources of specific type
+       - query_resource_graph(namespace="prod", filter_by="kind", filter_value="Deployment")
+    
+    2. Find specific resource: Get resource with immediate connections
+       - query_resource_graph(namespace="prod", resource_kind="Deployment", resource_name="nginx")
+    
+    3. Find dependency paths: Show how resources connect
+       - query_resource_graph(namespace="prod", find_path=True, 
+                              from_resource="Deployment:nginx", to_resource="Secret:db-creds")
+    
+    4. Filter by status: Find resources in specific state
+       - query_resource_graph(namespace="prod", filter_by="status", filter_value="Failed")
+    
+    5. Get connected resources: See what uses a resource (multi-hop with max_depth)
+       - query_resource_graph(namespace="prod", resource_kind="ConfigMap", 
+                              resource_name="app-config", filter_by="connections", max_depth=6)
+    
+    6. Find what uses a resource (reverse dependency)
+       - query_resource_graph(namespace="prod", resource_kind="Secret",
+                              resource_name="db-creds", filter_by="used_by", filter_value="Pod")
+    
+    Args:
+        namespace: Kubernetes namespace to query
+        resource_kind: Kind of resource to find (Deployment, Pod, etc.)
+        resource_name: Name of specific resource
+        filter_by: Filter type ("kind", "status", "connections", "used_by")
+        filter_value: Value to filter by (or resource kind for "used_by")
+        find_path: Find dependency path between resources
+        from_resource: Source resource in format "kind:name"
+        to_resource: Target resource in format "kind:name"
+        max_depth: Maximum hops for connection queries (default: 1)
+        context: Kubernetes context name (optional)
+    
+    Returns:
+        Filtered graph results in LLM-optimized format
+    """
+    k8s_client, _, _ = _ensure_initialized(context)
+    
+    try:
+        cluster = context or "default"
+        
+        graph = graph_cache.get(cluster, namespace)
+        if not graph:
+            return {
+                "error": f"No cached graph found for namespace '{namespace}'. Please run build_resource_graph first.",
+                "suggestion": f"Run: build_resource_graph(namespace='{namespace}')"
+            }
+        
+        cache_meta = graph_cache.get_metadata(cluster, namespace)
+        
+        import networkx as nx
+        
+        matched_nodes = []
+        matched_edges = []
+        suggestions = []
+        
+        if find_path and from_resource and to_resource:
+            from_kind, from_name = from_resource.split(":", 1)
+            to_kind, to_name = to_resource.split(":", 1)
+            from_id = f"{from_kind}:{namespace}:{from_name}"
+            to_id = f"{to_kind}:{namespace}:{to_name}"
+            
+            try:
+                path = nx.shortest_path(graph, source=from_id, target=to_id)
+                for node_id in path:
+                    attrs = graph.nodes[node_id]
+                    matched_nodes.append({
+                        "id": node_id,
+                        "kind": attrs.get("kind"),
+                        "name": attrs.get("name"),
+                        "status": attrs.get("status")
+                    })
+                
+                for i in range(len(path) - 1):
+                    edge_data = graph.get_edge_data(path[i], path[i+1])
+                    matched_edges.append({
+                        "source": path[i],
+                        "target": path[i+1],
+                        "relationship": edge_data.get("relationship_type", "unknown") if edge_data else "unknown"
+                    })
+                
+                suggestions.append(f"Path length: {len(path)} hops")
+            except nx.NetworkXNoPath:
+                return {
+                    "query": {"namespace": namespace, "find_path": True},
+                    "error": f"No path found from {from_resource} to {to_resource}"
+                }
+        
+        elif filter_by == "kind" and filter_value:
+            for node_id, attrs in graph.nodes(data=True):
+                if attrs.get("kind") == filter_value:
+                    matched_nodes.append({
+                        "id": node_id,
+                        "kind": attrs.get("kind"),
+                        "name": attrs.get("name"),
+                        "status": attrs.get("status"),
+                        "ready": attrs.get("ready")
+                    })
+            
+            suggestions.append(f"Show pods for these {filter_value}s")
+            suggestions.append(f"Find what ConfigMaps these use")
+        
+        elif resource_kind and resource_name:
+            resource_id = f"{resource_kind}:{namespace}:{resource_name}"
+            
+            if resource_id not in graph:
+                return {"error": f"Resource {resource_kind}/{resource_name} not found in graph"}
+            
+            attrs = graph.nodes[resource_id]
+            matched_nodes.append({
+                "id": resource_id,
+                "kind": attrs.get("kind"),
+                "name": attrs.get("name"),
+                "status": attrs.get("status")
+            })
+            
+            if filter_by == "connections":
+                visited = {resource_id}
+                to_visit = [(resource_id, 0)]
+                
+                while to_visit:
+                    current_id, depth = to_visit.pop(0)
+                    
+                    if depth >= max_depth:
+                        continue
+                    
+                    for src, tgt, edge_data in graph.edges(current_id, data=True):
+                        edge_dict = {
+                            "source": src,
+                            "target": tgt,
+                            "relationship": edge_data.get("relationship_type", "unknown"),
+                            "details": edge_data.get("details", "")
+                        }
+                        if edge_dict not in matched_edges:
+                            matched_edges.append(edge_dict)
+                        
+                        if tgt not in visited:
+                            visited.add(tgt)
+                            tgt_attrs = graph.nodes[tgt]
+                            matched_nodes.append({
+                                "id": tgt,
+                                "kind": tgt_attrs.get("kind"),
+                                "name": tgt_attrs.get("name"),
+                                "status": tgt_attrs.get("status"),
+                                "depth": depth + 1
+                            })
+                            to_visit.append((tgt, depth + 1))
+                    
+                    for src, tgt, edge_data in graph.in_edges(current_id, data=True):
+                        edge_dict = {
+                            "source": src,
+                            "target": tgt,
+                            "relationship": edge_data.get("relationship_type", "unknown"),
+                            "details": edge_data.get("details", "")
+                        }
+                        if edge_dict not in matched_edges:
+                            matched_edges.append(edge_dict)
+                        
+                        if src not in visited:
+                            visited.add(src)
+                            src_attrs = graph.nodes[src]
+                            matched_nodes.append({
+                                "id": src,
+                                "kind": src_attrs.get("kind"),
+                                "name": src_attrs.get("name"),
+                                "status": src_attrs.get("status"),
+                                "depth": depth + 1
+                            })
+                            to_visit.append((src, depth + 1))
+                
+                suggestions.append(f"Explored {max_depth} level(s) of dependencies")
+                if len(matched_nodes) > 50:
+                    suggestions.append(f"Large graph ({len(matched_nodes)} nodes), consider filtering by specific resource type")
+            
+            elif filter_by == "used_by":
+                target_kind = filter_value
+                for src, tgt, edge_data in graph.in_edges(resource_id, data=True):
+                    src_attrs = graph.nodes[src]
+                    if target_kind and src_attrs.get("kind") != target_kind:
+                        continue
+                    
+                    matched_edges.append({
+                        "source": src,
+                        "target": tgt,
+                        "relationship": edge_data.get("relationship_type", "unknown"),
+                        "details": edge_data.get("details", "")
+                    })
+                    
+                    if src not in [n["id"] for n in matched_nodes]:
+                        matched_nodes.append({
+                            "id": src,
+                            "kind": src_attrs.get("kind"),
+                            "name": src_attrs.get("name"),
+                            "status": src_attrs.get("status")
+                        })
+                
+                rel_types = {}
+                for edge in matched_edges:
+                    rel_type = edge["relationship"]
+                    rel_types[rel_type] = rel_types.get(rel_type, 0) + 1
+                
+                if target_kind:
+                    suggestions.append(f"Found {len(matched_nodes)-1} {target_kind}(s) using this {resource_kind}")
+                else:
+                    suggestions.append(f"Found {len(matched_nodes)-1} resources using this {resource_kind}")
+                
+                if rel_types:
+                    rel_summary = ", ".join(f"{count}x {rel}" for rel, count in rel_types.items())
+                    suggestions.append(f"Relationship types: {rel_summary}")
+        
+        elif filter_by == "status" and filter_value:
+            for node_id, attrs in graph.nodes(data=True):
+                if attrs.get("status") == filter_value:
+                    matched_nodes.append({
+                        "id": node_id,
+                        "kind": attrs.get("kind"),
+                        "name": attrs.get("name"),
+                        "status": attrs.get("status")
+                    })
+            
+            suggestions.append(f"Get logs for these failed resources")
+        
+        else:
+            return {"error": "Invalid query parameters. Specify filter_by, resource_kind/name, or find_path"}
+        
+        summary = f"Found {len(matched_nodes)} resources"
+        if filter_by == "kind" and filter_value:
+            summary = f"Found {len(matched_nodes)} {filter_value}(s) in namespace '{namespace}'"
+        elif find_path:
+            summary = f"Path from {from_resource} to {to_resource}"
+        elif filter_by == "used_by":
+            target_kind = filter_value or "resources"
+            summary = f"Found {len(matched_nodes)-1} {target_kind}(s) using {resource_kind}/{resource_name}"
+        elif filter_by == "connections":
+            summary = f"{resource_kind}/{resource_name} with {len(matched_nodes)-1} connected resources (depth: {max_depth})"
+        elif resource_kind and resource_name:
+            summary = f"{resource_kind}/{resource_name} with {len(matched_nodes)-1} connected resources"
+        
+        return {
+            "query": {
+                "namespace": namespace,
+                "cluster": cluster,
+                "filter_by": filter_by,
+                "filter_value": filter_value,
+                "resource_kind": resource_kind,
+                "resource_name": resource_name,
+                "find_path": find_path,
+                "from_resource": from_resource,
+                "to_resource": to_resource,
+                "max_depth": max_depth
+            },
+            "cache_hit": True,
+            "cache_age_seconds": cache_meta["age_seconds"] if cache_meta else 0,
+            "results": {
+                "matched_nodes": len(matched_nodes),
+                "matched_edges": len(matched_edges),
+                "nodes": matched_nodes[:100],
+                "edges": matched_edges[:100]
+            },
+            "summary": summary,
+            "query_suggestions": suggestions if suggestions else []
+        }
+    
+    except Exception as e:
+        logger.error(f"Error querying resource graph: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def analyze_resource_impact(
+    namespace: str,
+    resource_kind: str,
+    resource_name: str,
+    operation: str = "delete",
+    context: Optional[str] = None
+) -> dict:
+    """
+    Analyze the impact of deleting or updating a resource.
+    
+    Critical for debugging: "What will break if I delete this Secret/ConfigMap?"
+    
+    This tool:
+    - Finds all direct dependencies (Pods using the resource)
+    - Finds transitive dependencies (Deployments owning those Pods)
+    - Categorizes impact severity (critical, warning, safe)
+    - Provides actionable recommendations
+    
+    Examples:
+    # Check impact of deleting a Secret
+    analyze_resource_impact(namespace="prod", resource_kind="Secret", 
+                           resource_name="db-credentials", operation="delete")
+    
+    # Check impact of updating a ConfigMap
+    analyze_resource_impact(namespace="prod", resource_kind="ConfigMap",
+                           resource_name="app-config", operation="update")
+    
+    Args:
+        namespace: Kubernetes namespace
+        resource_kind: Kind of resource (Secret, ConfigMap, Service, etc.)
+        resource_name: Name of resource
+        operation: Operation type ("delete" or "update")
+        context: Kubernetes context name (optional)
+    
+    Returns:
+        Impact analysis with severity, affected resources, and recommendations
+    """
+    k8s_client, _, _ = _ensure_initialized(context)
+    
+    try:
+        cluster = context or "default"
+        
+        graph = graph_cache.get(cluster, namespace)
+        if not graph:
+            return {
+                "error": f"No cached graph found for namespace '{namespace}'. Please run build_resource_graph first.",
+                "suggestion": f"Run: build_resource_graph(namespace='{namespace}')"
+            }
+        
+        resource_id = f"{resource_kind}:{namespace}:{resource_name}"
+        
+        if resource_id not in graph:
+            return {"error": f"Resource {resource_kind}/{resource_name} not found in graph"}
+        
+        import networkx as nx
+        
+        direct_dependents = []
+        transitive_dependents = []
+        affected_by_kind = {}
+        relationship_types = {}
+        
+        for src, tgt, edge_data in graph.in_edges(resource_id, data=True):
+            src_attrs = graph.nodes[src]
+            rel_type = edge_data.get("relationship_type", "unknown")
+            
+            direct_dependents.append({
+                "id": src,
+                "kind": src_attrs.get("kind"),
+                "name": src_attrs.get("name"),
+                "relationship": rel_type,
+                "details": edge_data.get("details", "")
+            })
+            
+            kind = src_attrs.get("kind")
+            affected_by_kind[kind] = affected_by_kind.get(kind, 0) + 1
+            relationship_types[rel_type] = relationship_types.get(rel_type, 0) + 1
+            
+            try:
+                ancestors = nx.ancestors(graph, src)
+                for ancestor_id in ancestors:
+                    ancestor_attrs = graph.nodes[ancestor_id]
+                    ancestor_kind = ancestor_attrs.get("kind")
+                    if ancestor_kind in ["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet"]:
+                        if ancestor_id not in [t["id"] for t in transitive_dependents]:
+                            transitive_dependents.append({
+                                "id": ancestor_id,
+                                "kind": ancestor_kind,
+                                "name": ancestor_attrs.get("name"),
+                                "affects": src_attrs.get("name")
+                            })
+            except Exception as e:
+                logger.debug(f"Could not trace ancestors for {src}: {e}")
+        
+        severity = "safe"
+        critical_count = 0
+        warning_count = 0
+        
+        for dep in direct_dependents:
+            if dep["kind"] == "Pod":
+                if dep["relationship"] in ["volume", "env_var", "env_from"]:
+                    critical_count += 1
+                else:
+                    warning_count += 1
+            elif dep["kind"] in ["Deployment", "StatefulSet", "DaemonSet"]:
+                critical_count += 1
+            else:
+                warning_count += 1
+        
+        if critical_count > 0:
+            severity = "critical"
+        elif warning_count > 0:
+            severity = "warning"
+        
+        recommendations = []
+        if operation == "delete":
+            if severity == "critical":
+                recommendations.append(f"⚠️ DANGER: Deleting this {resource_kind} will immediately break {critical_count} resource(s)")
+                recommendations.append("Recommended: Update dependent resources first, or create a replacement")
+            elif severity == "warning":
+                recommendations.append(f"⚠️ WARNING: {warning_count} resource(s) reference this {resource_kind}")
+                recommendations.append("Verify these resources before deletion")
+            else:
+                recommendations.append(f"✅ Safe to delete - no active dependencies found")
+        else:
+            if severity == "critical":
+                recommendations.append(f"⚠️ Updating this {resource_kind} will affect {critical_count + warning_count} resource(s)")
+                recommendations.append("Consider rolling restart of Pods to pick up changes")
+            else:
+                recommendations.append(f"Update will affect {len(direct_dependents)} resource(s)")
+        
+        if "Pod" in affected_by_kind:
+            pod_count = affected_by_kind["Pod"]
+            recommendations.append(f"💡 {pod_count} Pod(s) will need restart to reflect changes")
+        
+        if transitive_dependents:
+            controllers = [d for d in transitive_dependents if d["kind"] in ["Deployment", "StatefulSet", "DaemonSet"]]
+            if controllers:
+                recommendations.append(f"💡 Consider updating {len(controllers)} controller(s) that manage affected Pods")
+        
+        summary = f"Impact analysis for {operation} of {resource_kind}/{resource_name}"
+        if severity == "critical":
+            summary += f" - 🔴 CRITICAL: {critical_count} resources at risk"
+        elif severity == "warning":
+            summary += f" - 🟡 WARNING: {warning_count} resources affected"
+        else:
+            summary += " - 🟢 SAFE: No critical dependencies"
+        
+        return {
+            "resource": {
+                "kind": resource_kind,
+                "name": resource_name,
+                "namespace": namespace
+            },
+            "operation": operation,
+            "severity": severity,
+            "impact": {
+                "direct_dependents": len(direct_dependents),
+                "transitive_dependents": len(transitive_dependents),
+                "affected_by_kind": affected_by_kind,
+                "relationship_types": relationship_types
+            },
+            "affected_resources": {
+                "direct": direct_dependents[:20],
+                "transitive": transitive_dependents[:20],
+                "truncated": len(direct_dependents) > 20 or len(transitive_dependents) > 20
+            },
+            "recommendations": recommendations,
+            "summary": summary
+        }
+    
+    except Exception as e:
+        logger.error(f"Error analyzing resource impact: {e}", exc_info=True)
         return {"error": str(e)}
 
 
