@@ -40,7 +40,29 @@ uv pip install -e ".[dev]"
 
 ### MCP Configuration
 
-Add to your Cursor MCP configuration (`~/.cursor/mcp.json`):
+#### Option 1: Using uvx (Recommended - No Installation Required)
+
+Add to your Cursor MCP configuration (`~/.cursor/mcp.json` or `.cursor/mcp.json` in your project):
+
+```json
+{
+  "mcpServers": {
+    "k8s-explorer-mcp": {
+      "command": "uvx",
+      "args": [
+        "--no-cache",
+        "k8s-explorer-mcp"
+      ]
+    }
+  }
+}
+```
+
+This method automatically downloads and runs the latest version from PyPI without requiring manual installation.
+
+#### Option 2: Local Development Setup
+
+For local development or testing unreleased changes:
 
 ```json
 {
