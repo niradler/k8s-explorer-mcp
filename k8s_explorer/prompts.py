@@ -296,3 +296,137 @@ build_resource_graph(
         )
     ]
 
+
+async def create_namespace_onboarding(context: str, namespace: str = "default") -> PromptResult:
+    """
+    Generate a comprehensive namespace onboarding document for new employees.
+
+    Creates a detailed markdown document covering architecture, observability,
+    deployment processes, and operational tools for a specific namespace.
+    Includes Mermaid diagrams and practical guides.
+
+    **For broader cluster context:** Run this prompt multiple times for different
+    namespaces (e.g., 'default', 'kube-system', 'monitoring') and combine the results
+    to create a complete cluster overview.
+
+    Args:
+        context: Kubernetes context/cluster name (e.g., 'production', 'staging')
+        namespace: Namespace to document (default: default)
+
+    Returns:
+        A structured workflow to create {context}-{namespace}-onboarding.md
+    """
+    return [
+        Message(
+            f"""Create namespace onboarding doc: `{context}-{namespace}-onboarding.md`
+
+**💡 Multi-namespace:** Run for each namespace (default, kube-system, monitoring) then combine.
+
+## Workflow
+
+### 1. Gather Data (PARALLEL)
+```
+build_resource_graph(namespace="{namespace}", depth=3, context="{context}")
+list_resources(kind="DaemonSet", namespace="{namespace}", context="{context}")
+```
+
+### 2. Extract from Graph
+
+**Monitoring:**
+- DaemonSets: `datadog`, `prometheus-node-exporter` (runs on every node)
+- Cluster agents: `*-cluster-agent`, `kube-state-metrics` (count replicas)
+- ConfigMaps/Secrets: `*-config`, `*-credentials`, `*-api-key`
+
+**Logging:**
+- Deployments: `*-logs`, `fluentd`, `fluent-bit` (count replicas, DaemonSet or Deployment?)
+
+**Telemetry/APM:**
+- OTel collectors: `*-otel-collector`, `otel-*` (count replicas)
+- APM: `dynatrace`, `newrelic`, `datadog-apm`
+
+**Deployment Method:**
+- Helm: Check for Secrets `sh.helm.release.*` (count unique charts)
+- No Helm: Document kubectl/GitOps
+
+**Config Patterns:**
+- Count `env_var` edges (primary config method)
+- Count `volume` edges (file-based config)
+- Total ConfigMaps/Secrets
+
+**Workers:**
+- Find: `*-worker`, `*-cron`, `*-consumer`, `*-job` (count replicas)
+
+### 3. Create Markdown
+
+**Structure:**
+```markdown
+# {namespace.title()} Namespace - {context.title()} Cluster
+
+**Namespace:** `{namespace}` | **Pods:** X (Y% healthy)
+💡 For other namespaces, generate separate docs.
+
+## TL;DR
+- **Monitoring:** [Datadog DaemonSet + X replicas cluster agent] OR [tool found]
+- **Logging:** [agents-service-logs X pods] OR [tool found]
+- **Telemetry:** [OTel collector X pods → Datadog]
+- **Deployment:** [Helm with X charts] OR [kubectl/GitOps]
+- **Config:** [N env vars, M volumes]
+- **Access:** https://app.datadoghq.com (if Datadog)
+
+## Architecture (Mermaid)
+[High-level: services grouped by function with replica counts]
+[Observability: Apps → Collection → Backend]
+[Top app detail: Deployment → RS → Pods → ConfigMaps/Secrets]
+
+## Observability Stack
+### Monitoring (if Datadog)
+- DaemonSet on every node
+- Cluster agent (N replicas)
+- ConfigMaps: [list], Secrets: [list]
+- Access: https://app.datadoghq.com
+- Query: `service:X status:error`, `pod_name:X*`
+
+### Telemetry (if OTel)
+- Collector (N replicas)
+- Endpoints: `service:4317` (gRPC), `:4318` (HTTP)
+- Forwards to: [Datadog/etc.]
+
+### Logging
+- [Custom service X pods] + [Datadog auto-collection]
+- kubectl logs: `kubectl logs -f deployment/X -n {namespace}`
+
+### Deployment
+- [Helm charts: list OR kubectl apply]
+- Rollback: `kubectl rollout undo deployment/X -n {namespace}`
+
+## Workers & Jobs
+[List: name, replicas, purpose]
+
+## Getting Started
+```bash
+kubectl config use-context {context}
+kubectl get pods -n {namespace}
+kubectl logs -f deployment/[largest-app] -n {namespace}
+```
+
+## Troubleshooting
+1. Check Datadog APM → Services
+2. Check logs: Datadog or kubectl
+3. Check events: `kubectl get events -n {namespace}`
+```
+
+### 4. Guidelines
+- Use ACTUAL data (no placeholders)
+- Document what EXISTS (no Helm = say "No Helm")
+- Aggregate: 50 pods → "App: 50 replicas"
+- Include real URLs, query syntax, replica counts
+
+### 5. Checklist
+✅ Namespace stats ✅ Monitoring details ✅ Logging arch ✅ Telemetry endpoints
+✅ Deployment method ✅ Config patterns ✅ Access URLs ✅ kubectl commands
+
+**Execute: Query graph → Extract patterns → Generate markdown with REAL data.**""",
+            role="user",
+        )
+    ]
+
